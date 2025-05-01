@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: video-analysis-app
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./static/uploads:/app/static/uploads
+    environment:
+      - FLASK_ENV=production
+      - FLASK_APP=api/main.py
+    restart: unless-stopped
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge 
