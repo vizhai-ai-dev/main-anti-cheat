@@ -3,18 +3,21 @@ version: '3.8'
 services:
   app:
     build: .
-    container_name: video-analysis-app
     ports:
-      - "5001:5001"
+      - "8000:8000"
     volumes:
-      - ./static/uploads:/app/static/uploads
+      - .:/app
     environment:
-      - FLASK_ENV=production
-      - FLASK_APP=api/main.py
+      - HF_TOKEN=${HF_TOKEN}
     restart: unless-stopped
-    networks:
-      - app-network
 
-networks:
-  app-network:
-    driver: bridge 
+  streamlit:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+    command: streamlit run main.py
+    restart: unless-stopped 
