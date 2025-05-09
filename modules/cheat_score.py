@@ -3,6 +3,11 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import numpy as np
 from enum import Enum
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class RiskLevel(str, Enum):
     LOW = "Low"
@@ -103,50 +108,145 @@ class CheatScoreCalculator:
             
         return reasons
 
-def compute_cheating_score(results_dict: Dict) -> Dict:
-    """Compute final cheating score from all module results"""
-    calculator = CheatScoreCalculator()
+def calculate_risk_score(
+    screen_results: Optional[Dict[str, Any]] = None,
+    gaze_results: Optional[Dict[str, Any]] = None,
+    person_results: Optional[Dict[str, Any]] = None,
+    audio_results: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Calculate overall risk score based on results from all detection modules.
     
-    # Extract module scores
-    screen_score = results_dict['screen_switch'].get('suspicion_score', 0)
-    gaze_score = results_dict['gaze'].get('score', 0)
-    audio_score = results_dict['audio'].get('score', 0)
-    multi_score = results_dict['multi_person'].get('score', 0)
+    Args:
+        screen_results: Results from screen change detection
+        gaze_results: Results from gaze tracking
+        person_results: Results from person detection
+        audio_results: Results from audio analysis
+        
+    Returns:
+        Dict containing:
+            - risk_score: Overall risk score (0-100)
+            - risk_level: Low/Medium/High
+            - reasons: List of reasons for the risk assessment
+            - module_scores: Individual scores from each module
+    """
     
-    # Calculate weighted final score
-    final_score = (
-        screen_score * calculator.MODULE_WEIGHTS['screen_switch'] +
-        gaze_score * calculator.MODULE_WEIGHTS['gaze'] +
-        audio_score * calculator.MODULE_WEIGHTS['audio'] +
-        multi_score * calculator.MODULE_WEIGHTS['multi_person']
-    )
-    
-    # Determine risk level
-    risk_level = calculator.get_risk_level(final_score)
-    
-    # Collect reasons from all modules
-    reasons = []
-    reasons.extend(calculator.get_screen_switch_reasons(results_dict['screen_switch']))
-    reasons.extend(calculator.get_gaze_reasons(results_dict['gaze']))
-    reasons.extend(calculator.get_audio_reasons(results_dict['audio']))
-    reasons.extend(calculator.get_multi_person_reasons(results_dict['multi_person']))
-    
-    return {
-        "final_score": round(final_score, 1),
-        "risk": risk_level,
-        "reasons": reasons,
-        "module_scores": {
-            "screen_switch": round(screen_score, 1),
-            "gaze": round(gaze_score, 1),
-            "audio": round(audio_score, 1),
-            "multi_person": round(multi_score, 1)
-        }
+    # Initialize results
+    results = {
+        'risk_score': 0,
+        'risk_level': 'Low',
+        'reasons': [],
+        'module_scores': {}
     }
+    
+    try:
+        # Screen monitoring score (30% weight)
+        screen_score = 0
+        if screen_results:
+            screen_violations = (
+                screen_results.get('fullscreen_violations', 0) +
+                screen_results.get('overlay_detections', 0) +
+                screen_results.get('scene_switches', 0)
+            )
+            screen_score = min(100, screen_violations * 20)  # 20 points per violation
+            results['module_scores']['screen'] = screen_score
+            
+            if screen_violations > 0:
+                results['reasons'].append(
+                    f"Detected {screen_violations} screen violations"
+                )
+                
+        # Gaze tracking score (25% weight)
+        gaze_score = 0
+        if gaze_results:
+            off_screen_ratio = gaze_results.get('off_screen_ratio', 0)
+            rapid_movements = gaze_results.get('rapid_movements', 0)
+            
+            gaze_score = min(100, (
+                off_screen_ratio * 70 +  # Up to 70 points for looking away
+                rapid_movements * 10     # 10 points per suspicious eye movement
+            ))
+            results['module_scores']['gaze'] = gaze_score
+            
+            if off_screen_ratio > 0.2:  # More than 20% time looking away
+                results['reasons'].append(
+                    f"Subject looked away from screen {int(off_screen_ratio * 100)}% of the time"
+                )
+                
+        # Person detection score (25% weight)
+        person_score = 0
+        if person_results:
+            extra_people = person_results.get('max_people_detected', 1) - 1
+            person_score = min(100, extra_people * 100)  # 100 points per extra person
+            results['module_scores']['person'] = person_score
+            
+            if extra_people > 0:
+                results['reasons'].append(
+                    f"Detected {extra_people} additional people in frame"
+                )
+                
+        # Audio analysis score (20% weight)
+        audio_score = 0
+        if audio_results:
+            if audio_results.get('has_audio', True):  # Only consider if video has audio
+                audio_score = audio_results.get('score', 0)
+                results['module_scores']['audio'] = audio_score
+                
+                if audio_results.get('num_speakers', 1) > 1:
+                    results['reasons'].append(
+                        f"Detected {audio_results['num_speakers']} different speakers"
+                    )
+                if audio_results.get('whispers_detected', False):
+                    results['reasons'].append("Detected whispered speech")
+                    
+        # Calculate weighted average
+        weights = {
+            'screen': 0.30,
+            'gaze': 0.25,
+            'person': 0.25,
+            'audio': 0.20
+        }
+        
+        total_weight = 0
+        weighted_score = 0
+        
+        for module, score in results['module_scores'].items():
+            weighted_score += score * weights[module]
+            total_weight += weights[module]
+            
+        if total_weight > 0:
+            results['risk_score'] = round(weighted_score / total_weight, 1)
+            
+        # Determine risk level
+        if results['risk_score'] >= 70:
+            results['risk_level'] = 'High'
+        elif results['risk_score'] >= 40:
+            results['risk_level'] = 'Medium'
+        else:
+            results['risk_level'] = 'Low'
+            
+        # Add summary reason if no specific reasons found
+        if not results['reasons']:
+            if results['risk_score'] < 20:
+                results['reasons'].append("No suspicious behavior detected")
+            else:
+                results['reasons'].append("Multiple minor suspicious indicators detected")
+                
+    except Exception as e:
+        logger.error(f"Error calculating risk score: {str(e)}")
+        raise
+        
+    return results
 
 @app.post("/cheat_score")
 async def calculate_score(results: ModuleResults):
     try:
-        score_results = compute_cheating_score(results.dict())
+        score_results = calculate_risk_score(
+            screen_results=results.screen_switch,
+            gaze_results=results.gaze,
+            person_results=results.multi_person,
+            audio_results=results.audio
+        )
         return score_results
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

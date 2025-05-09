@@ -58,8 +58,9 @@ class AudioAnalyzer:
             ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
             return temp_audio.name
         except ffmpeg.Error as e:
-            logger.error(f"FFmpeg error: {e.stderr.decode()}")
-            raise Exception(f"Error extracting audio: {str(e)}")
+            error_message = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr is not None else str(e)
+            logger.error(f"FFmpeg error: {error_message}")
+            raise Exception(f"Error extracting audio: {error_message}")
         except Exception as e:
             logger.error(f"Error in extract_audio: {str(e)}")
             raise
@@ -176,6 +177,7 @@ def detect_audio_anomalies(video_path: str) -> Dict[str, Any]:
             - anomaly_timestamps: List of timestamps where anomalies occurred
             - suspicion_score: Score indicating likelihood of cheating (0-100)
             - transcript: Text transcript of the audio
+            - has_audio: Boolean indicating if the video had audio
     """
     try:
         # Initialize results
@@ -183,84 +185,72 @@ def detect_audio_anomalies(video_path: str) -> Dict[str, Any]:
             'anomaly_count': 0,
             'anomaly_timestamps': [],
             'suspicion_score': 0,
-            'transcript': ''
+            'transcript': '',
+            'has_audio': True
         }
         
-        # Create analyzer instance
-        analyzer = AudioAnalyzer()
+        # Check if video has audio by probing
+        probe = ffmpeg.probe(video_path)
+        audio_streams = [stream for stream in probe['streams'] if stream['codec_type'] == 'audio']
         
-        # Extract audio from video
-        audio_path = analyzer.extract_audio(video_path)
+        if not audio_streams:
+            results['has_audio'] = False
+            results['transcript'] = "No audio detected in video"
+            return results
+            
+        # Extract audio for analysis
+        audio_path = extract_audio(video_path)
         
         try:
-            # Load Whisper model for speech recognition
-            model = whisper.load_model("base")
+            # Load the audio file
+            audio = whisper.load_audio(audio_path)
             
+            # Check if audio is silent (all zeros or very low amplitude)
+            if np.max(np.abs(audio)) < 0.01:  # Threshold for "silence"
+                results['has_audio'] = False
+                results['transcript'] = "Video contains silent audio track"
+                return results
+                
             # Transcribe audio
-            transcription = model.transcribe(audio_path)
+            transcription = self.whisper_model.transcribe(audio_path)
             results['transcript'] = transcription['text']
             
-            # Initialize speaker diarization
-            pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization",
-                use_auth_token=os.getenv("HF_TOKEN")  # Use environment variable
-            )
+            # Perform diarization if there is actual audio content
+            diarization = self.diarization_pipeline(audio_path)
             
-            # Run speaker diarization
-            diarization = pipeline(audio_path)
-            
-            # Analyze speaker patterns
+            # Process diarization results
             speaker_segments = []
             for turn, _, speaker in diarization.itertracks(yield_label=True):
                 speaker_segments.append({
+                    'speaker': speaker,
                     'start': turn.start,
-                    'end': turn.end,
-                    'speaker': speaker
+                    'end': turn.end
                 })
             
-            # Detect anomalies
-            anomalies = []
-            
-            # Check for multiple speakers
-            unique_speakers = len(set(seg['speaker'] for seg in speaker_segments))
-            if unique_speakers > 1:
+            # Analyze for anomalies
+            num_speakers = len(set(segment['speaker'] for segment in speaker_segments))
+            if num_speakers > 1:
                 results['anomaly_count'] += 1
-                anomalies.append({
-                    'type': 'multiple_speakers',
-                    'timestamp': speaker_segments[0]['start'],
-                    'confidence': 0.8
-                })
-            
-            # Check for suspicious keywords in transcript
-            suspicious_keywords = ['answer', 'cheat', 'help', 'copy', 'google']
-            for word in suspicious_keywords:
-                if word.lower() in results['transcript'].lower():
-                    results['anomaly_count'] += 1
-                    # Find timestamp of the word
-                    word_index = results['transcript'].lower().find(word.lower())
-                    timestamp = word_index / len(results['transcript']) * len(speaker_segments)
-                    anomalies.append({
-                        'type': 'suspicious_keyword',
-                        'timestamp': timestamp,
-                        'confidence': 0.7
-                    })
+                results['anomaly_timestamps'].extend([
+                    segment['start'] for segment in speaker_segments
+                    if segment['speaker'] != speaker_segments[0]['speaker']
+                ])
             
             # Calculate suspicion score
-            base_score = min(results['anomaly_count'] * 20, 100)  # 20 points per anomaly, max 100
-            results['suspicion_score'] = base_score
-            
-            # Add timestamps of anomalies
-            results['anomaly_timestamps'] = [anomaly['timestamp'] for anomaly in anomalies]
+            results['suspicion_score'] = min(100, (
+                (num_speakers - 1) * 50 +  # Multiple speakers
+                (len(results['anomaly_timestamps']) * 10)  # Frequency of anomalies
+            ))
             
         finally:
-            # Cleanup
+            # Clean up temporary audio file
             if os.path.exists(audio_path):
                 os.remove(audio_path)
                 
         return results
         
     except Exception as e:
-        logger.error(f"Error in audio analysis: {str(e)}")
+        logging.error(f"Error in audio analysis: {str(e)}")
         raise
 
 if __name__ == "__main__":
