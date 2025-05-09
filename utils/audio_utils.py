@@ -17,12 +17,35 @@ def extract_audio(video_path: str, output_path: Optional[str] = None) -> str:
         temp_audio.close()
         
     try:
+        # First probe the input file to check for audio streams
+        probe = ffmpeg.probe(video_path)
+        audio_streams = [stream for stream in probe['streams'] if stream['codec_type'] == 'audio']
+        
+        if not audio_streams:
+            # Create a silent WAV file if no audio stream is found
+            with wave.open(output_path, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # Mono
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(16000)  # 16kHz
+                # Write 1 second of silence
+                wav_file.writeframes(b'\x00' * 32000)
+            return output_path
+            
+        # Extract audio using ffmpeg with explicit stream mapping
         stream = ffmpeg.input(video_path)
-        stream = ffmpeg.output(stream, output_path, acodec='pcm_s16le', ac=1, ar='16k')
-        ffmpeg.run(stream, capture_stdout=True, capture_stderr=True)
+        stream = ffmpeg.output(
+            stream,
+            output_path,
+            acodec='pcm_s16le',
+            ac=1,
+            ar='16k',
+            map='0:a:0'  # Map the first audio stream
+        )
+        ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
         return output_path
     except ffmpeg.Error as e:
-        raise Exception(f"Error extracting audio: {str(e)}")
+        error_message = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr is not None else str(e)
+        raise Exception(f"Error extracting audio: {error_message}")
 
 def get_audio_info(audio_path: str) -> dict:
     """Get audio file metadata"""
